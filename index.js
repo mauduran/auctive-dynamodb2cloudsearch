@@ -6,7 +6,13 @@ let CloudSearch = new aws.CloudSearchDomain({
     apiVersion: '2013-01-01'
 });
 
-const create_cs_request = (id, record, operation) => {
+const EVENT_MAPPING = {
+    "INSERT": 'add',
+    "MODIFY": 'add',
+    "REMOVE": 'delete'
+}
+
+const createAuctionCsRequest = (id, record, operation) => {
     let request = {
         type: operation,
         id: id
@@ -20,7 +26,7 @@ const create_cs_request = (id, record, operation) => {
             starting_price: record.starting_price.N,
             buy_now_price: record.buy_now_price.N,
             category: record.category.S,
-            product_img_urls: record.product_img_urls.L.map(url=>url.S),
+            product_img_urls: record.product_img_urls.L.map(url => url.S),
             start_date: record.start_date.S,
             status: record.status.S
         };
@@ -36,7 +42,7 @@ const create_cs_request = (id, record, operation) => {
     return request;
 }
 
-function send_record_requests(requests) {
+const sendRequestsToCS = (requests) => {
     var params = {
         contentType: 'application/json',
         documents: JSON.stringify(requests)
@@ -45,35 +51,44 @@ function send_record_requests(requests) {
     return new Promise((resolve, reject) => {
         CloudSearch.uploadDocuments(params, function (err, data) {
             if (err) {
-                reject(err);
-            } else {
-                resolve(data);
+                return reject(err);
             }
+            return resolve(data);
         });
     })
 };
 
+const processRecord = (record) => {
+    const pk = record.dynamodb.Keys.PK.S;
+    const sk = record.dynamodb.Keys.SK.S;
 
-exports.handler = async (event, context) => {
+    if (pk.includes("AUCTION#") && sk.includes("#AUCTION_USER#")) {
+        return createAuctionCsRequest(pk, record.dynamodb.NewImage, EVENT_MAPPING[record.eventName]);
+    }
+    return null;
+
+}
+
+const writeStreamToCloudSearch = async (event) => {
     let requests = [];
 
-    for (const record of event.Records) {
-        try {
-            let pk = record.dynamodb.Keys.PK.S;
-            if (pk.includes("AUCTION#") && record.dynamodb.Keys.SK.S.includes("#AUCTION_USER#")) {
-                if (record.eventName === "INSERT" || record.eventName === "MODIFY") {
-                    requests.push(create_cs_request(pk, record.dynamodb.NewImage, "add"));
-                } else if (record.eventName === "REMOVE") {
-                    requests.push(create_cs_request(pk, record.dynamodb.OldImage, "delete"));
-                }
-            }
+    try {
+        for (const record of event.Records) {
+            let request = processRecord(record);
 
-            if (requests.length) await send_record_requests(requests);
-            return `Successfully processed ${requests.length} records.`;
+            if (request) {
+                requests.push(request);
+            }
         }
-        catch (err) {
-            console.log(err);
-            return "Could not process records;"
-        }
+        if (requests.length) await sendRequestsToCS(requests);
+        return `Successfully processed ${requests.length} records.`;
     }
+    catch (err) {
+        console.log(err);
+        return "Could not process records;"
+    }
+}
+
+exports.handler = async (event, context) => {
+    return writeStreamToCloudSearch(event);
 }
